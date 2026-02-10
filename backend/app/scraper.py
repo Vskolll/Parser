@@ -62,6 +62,7 @@ class RecheckItem:
     title: str
     url: str
     likes: int
+    price: str
     date: str
     status: str
     photo: str
@@ -580,6 +581,33 @@ def _extract_last_updated(soup: BeautifulSoup, raw_html: str = "") -> str:
     return ""
 
 
+def _extract_detail_price(soup: BeautifulSoup, raw_html: str = "") -> str:
+    # Primary selectors used on FINN item pages.
+    for selector in ("p.m-0.h2", "div.h2"):
+        for node in soup.select(selector):
+            text = _clean(node.get_text(" "))
+            match = PRICE_RE.search(text)
+            if match:
+                return _clean(match.group(0))
+
+    # Prefer price near the "Til salgs" label.
+    for node in soup.find_all(["h2", "p", "span", "div"]):
+        if _clean(node.get_text(" ")).lower() != "til salgs":
+            continue
+        parent = node.parent if hasattr(node, "parent") else None
+        if not parent:
+            continue
+        text = _clean(parent.get_text(" "))
+        match = PRICE_RE.search(text)
+        if match:
+            return _clean(match.group(0))
+
+    match = PRICE_RE.search(_clean(raw_html))
+    if match:
+        return _clean(match.group(0))
+    return ""
+
+
 def _extract_photo_url(soup: BeautifulSoup, base_url: str) -> str:
     meta = soup.find("meta", attrs={"property": "og:image"})
     if meta and meta.get("content"):
@@ -615,6 +643,7 @@ async def fetch_listing_detail(url: str) -> dict:
             "url": url,
             "title": _extract_title_detail(soup),
             "likes": _extract_likes(soup, html),
+            "price": _extract_detail_price(soup, html),
             "date": _extract_last_updated(soup, html),
             "status": _extract_status(soup, status_code, html),
             "photo": _extract_photo_url(soup, url),
@@ -631,6 +660,7 @@ async def fetch_listing_detail(url: str) -> dict:
                 "url": url,
                 "title": "",
                 "likes": 0,
+                "price": "",
                 "date": "",
                 "status": "404",
                 "photo": "",
@@ -680,6 +710,7 @@ async def recheck_rows(
                 title=title,
                 url=url,
                 likes=int(details.get("likes") or 0),
+                price=_clean(details.get("price")),
                 date=_clean(details.get("date")),
                 status=status,
                 photo=_clean(details.get("photo")),

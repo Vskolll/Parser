@@ -225,7 +225,7 @@ def _build_parse_xlsx(rows: List[dict]) -> io.BytesIO:
 
 
 def _build_recheck_xlsx(rows: List[dict]) -> io.BytesIO:
-    ordered_columns = ["категория", "название", "ссылка", "количество лайков", "дата", "статус", "фото"]
+    ordered_columns = ["категория", "название", "ссылка", "количество лайков", "цена", "дата", "статус", "фото"]
     df = pd.DataFrame(rows, columns=ordered_columns)
 
     output = io.BytesIO()
@@ -238,9 +238,10 @@ def _build_recheck_xlsx(rows: List[dict]) -> io.BytesIO:
             "B": 52,
             "C": 58,
             "D": 20,
-            "E": 24,
-            "F": 14,
-            "G": 58,
+            "E": 16,
+            "F": 24,
+            "G": 14,
+            "H": 58,
         }
         for col, width in widths.items():
             ws.column_dimensions[col].width = width
@@ -707,6 +708,7 @@ async def _send_recheck_alert(
         f"Статус: {row.get('статус', '')}\n"
         f"Название: {row.get('название', '')}\n"
         f"Лайки: {row.get('количество лайков', 0)}\n"
+        f"Цена: {row.get('цена', '')}\n"
         f"Ссылка: {row.get('ссылка', '')}"
     )
     caption = caption[:1000]
@@ -812,6 +814,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "название": item.title,
             "ссылка": item.url,
             "количество лайков": item.likes,
+            "цена": item.price,
             "дата": item.date,
             "статус": item.status,
             "фото": item.photo,
