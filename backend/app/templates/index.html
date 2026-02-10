@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Finn Parser</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="app">
+    <header class="hero">
+      <h1>Finn Parser</h1>
+      <p>Выбирай категорию и подкатегорию, жми «Парсить» и получай XLSX таблицу.</p>
+    </header>
+
+    <section class="panel">
+      <div class="grid">
+        <div>
+          <h2>Подкатегории Torget</h2>
+          <div id="subcategories" class="list"></div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Макс. объявлений</label>
+        <input id="maxItems" type="number" value="50" min="1" max="200" />
+      </div>
+
+      <div class="actions">
+        <button id="parseBtn" disabled>Парсить</button>
+        <button id="downloadBtn" disabled>Скачать XLSX</button>
+      </div>
+
+      <div id="status" class="status"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Ре-чек (сравнение)</h2>
+      <div class="field">
+        <input id="recheckFile" type="file" accept=".xlsx" />
+        <button id="recheckBtn">Проверить</button>
+      </div>
+      <div id="recheckStatus" class="status"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Предпросмотр</h2>
+      <div class="table-wrap">
+        <table id="preview">
+          <thead>
+            <tr>
+              <th>Категория</th>
+              <th>Подкатегория</th>
+              <th>Заголовок</th>
+              <th>Фото</th>
+              <th>Цена</th>
+              <th>Статус</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
