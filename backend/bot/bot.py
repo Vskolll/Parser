@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import time
 from dataclasses import asdict
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -28,6 +30,9 @@ from app.scraper import ParseFilters, TORGET_SUBCATEGORIES, fetch_listing_detail
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 MAX_ITEMS_PER_CATEGORY = 5000
 MAX_PAGES_PER_CATEGORY = 80
+ACCESS_KEY = os.getenv("BOT_ACCESS_KEY", "Ivanshurpato12")
+OWNER_FILE = Path(__file__).resolve().parent / ".bot_owner.json"
+OWNER_USER_ID: Optional[int] = None
 
 CATEGORY_OPTIONS: List[Dict[str, str]] = [
     {
@@ -41,6 +46,7 @@ CATEGORY_BY_ID: Dict[str, Dict[str, str]] = {item["id"]: item for item in CATEGO
 
 
 def _init_user_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await_access_key = bool(context.user_data.get("await_access_key", False))
     context.user_data["selected_categories"] = []
     context.user_data["filters"] = {
         "fiks_ferdig": False,
@@ -52,6 +58,99 @@ def _init_user_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["await_price_to"] = False
     context.user_data["await_recheck"] = False
     context.user_data["await_link_check"] = False
+    context.user_data["await_access_key"] = await_access_key
+
+
+def _load_owner_user_id() -> Optional[int]:
+    global OWNER_USER_ID
+    if OWNER_USER_ID is not None:
+        return OWNER_USER_ID
+    if not OWNER_FILE.exists():
+        return None
+    try:
+        data = json.loads(OWNER_FILE.read_text(encoding="utf-8"))
+        user_id = int(data.get("user_id"))
+        OWNER_USER_ID = user_id
+        return user_id
+    except Exception:
+        return None
+
+
+def _save_owner(user_id: int) -> None:
+    global OWNER_USER_ID
+    OWNER_USER_ID = int(user_id)
+    OWNER_FILE.write_text(json.dumps({"user_id": OWNER_USER_ID}, ensure_ascii=False), encoding="utf-8")
+
+
+def _is_owner(update: Update) -> bool:
+    user = update.effective_user
+    owner_id = _load_owner_user_id()
+    return bool(user and owner_id and user.id == owner_id)
+
+
+async def _reply_any(
+    update: Update,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    if update.message:
+        await update.message.reply_text(text, reply_markup=reply_markup)
+        return
+    if update.callback_query and update.callback_query.message:
+        await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
+
+
+async def _ensure_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            pass
+
+    owner_id = _load_owner_user_id()
+    if owner_id is None:
+        context.user_data["await_access_key"] = True
+        await _reply_any(update, "Введите ключ доступа:")
+        return False
+
+    if _is_owner(update):
+        return True
+
+    await _reply_any(update, "Доступ запрещен. Бот привязан к другому пользователю.")
+    return False
+
+
+async def _try_handle_access_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.message
+    if not message:
+        return False
+
+    text = (message.text or "").strip()
+    if not text:
+        return False
+
+    owner_id = _load_owner_user_id()
+    if owner_id is not None:
+        if _is_owner(update):
+            return False
+        await message.reply_text("Доступ запрещен. Бот привязан к другому пользователю.")
+        return True
+
+    if text == ACCESS_KEY:
+        user = update.effective_user
+        if not user:
+            await message.reply_text("Ошибка авторизации.")
+            return True
+        _save_owner(user.id)
+        context.user_data["await_access_key"] = False
+        _init_user_state(context)
+        context.user_data["await_access_key"] = False
+        await message.reply_text("Ключ принят. Доступ открыт.", reply_markup=_main_keyboard())
+        return True
+
+    context.user_data["await_access_key"] = True
+    await message.reply_text("Неверный ключ. Попробуй еще раз.")
+    return True
 
 
 def _main_keyboard() -> InlineKeyboardMarkup:
@@ -229,6 +328,8 @@ async def _safe_edit_or_send(
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_authorized(update, context):
+        return
     _init_user_state(context)
 
     if update.message:
@@ -239,6 +340,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def parse_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_authorized(update, context):
+        return
     _init_user_state(context)
     context.user_data["await_recheck"] = False
     if update.message:
@@ -249,6 +352,8 @@ async def parse_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_authorized(update, context):
+        return
     _init_user_state(context)
     context.user_data["await_recheck"] = True
     if update.message:
@@ -256,6 +361,8 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_authorized(update, context):
+        return
     _init_user_state(context)
     context.user_data["await_link_check"] = True
     if update.message:
@@ -263,6 +370,8 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def handle_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_authorized(update, context):
+        return
     await _safe_query_answer(update)
 
     action = (update.callback_query.data or "").split(":", 1)[1]
@@ -288,6 +397,8 @@ async def handle_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_authorized(update, context):
+        return
     await _safe_query_answer(update)
 
     selected: List[str] = context.user_data.get("selected_categories", [])
@@ -468,6 +579,8 @@ async def _run_parse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def handle_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_authorized(update, context):
+        return
     await _safe_query_answer(update)
 
     data = update.callback_query.data or ""
@@ -524,6 +637,11 @@ async def handle_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _try_handle_access_key(update, context):
+        return
+    if not await _ensure_authorized(update, context):
+        return
+
     message = update.message
     if not message:
         return
@@ -605,6 +723,9 @@ async def _send_recheck_alert(
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _ensure_authorized(update, context):
+        return
+
     message = update.message
     if not message:
         return
