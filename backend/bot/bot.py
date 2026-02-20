@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -58,6 +58,8 @@ def _init_user_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["await_price_to"] = False
     context.user_data["await_recheck"] = False
     context.user_data["await_link_check"] = False
+    context.user_data["await_merge_parse"] = False
+    context.user_data["merge_parse_rows"] = []
     context.user_data["await_access_key"] = await_access_key
 
 
@@ -158,6 +160,7 @@ def _main_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("Парсить", callback_data="main:parse")],
             [InlineKeyboardButton("Ре-чек", callback_data="main:recheck")],
+            [InlineKeyboardButton("Объединить парсы", callback_data="main:merge")],
             [InlineKeyboardButton("Чек ссылки", callback_data="main:linkcheck")],
         ]
     )
@@ -225,7 +228,7 @@ def _build_parse_xlsx(rows: List[dict]) -> io.BytesIO:
 
 
 def _build_recheck_xlsx(rows: List[dict]) -> io.BytesIO:
-    ordered_columns = ["категория", "название", "ссылка", "количество лайков", "цена", "дата", "статус", "фото"]
+    ordered_columns = ["категория", "название", "ссылка", "цена", "дата", "статус", "фото"]
     df = pd.DataFrame(rows, columns=ordered_columns)
 
     output = io.BytesIO()
@@ -237,17 +240,238 @@ def _build_recheck_xlsx(rows: List[dict]) -> io.BytesIO:
             "A": 28,
             "B": 52,
             "C": 58,
-            "D": 20,
-            "E": 16,
-            "F": 24,
-            "G": 14,
-            "H": 58,
+            "D": 16,
+            "E": 24,
+            "F": 14,
+            "G": 58,
         }
         for col, width in widths.items():
             ws.column_dimensions[col].width = width
 
     output.seek(0)
     return output
+
+
+def _build_active_xlsx(rows: List[dict]) -> io.BytesIO:
+    ordered_columns = ["категория", "название", "ссылка", "цена", "дата", "статус", "фото"]
+    df = pd.DataFrame(rows, columns=ordered_columns)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="active")
+        ws = writer.sheets["active"]
+
+        widths = {
+            "A": 28,
+            "B": 52,
+            "C": 58,
+            "D": 16,
+            "E": 24,
+            "F": 14,
+            "G": 58,
+        }
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
+
+    output.seek(0)
+    return output
+
+
+def _build_merge_xlsx(rows: List[dict]) -> io.BytesIO:
+    ordered_columns = ["категория", "название", "ссылка", "цена", "дата парса"]
+    df = pd.DataFrame(rows, columns=ordered_columns)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="data")
+        ws = writer.sheets["data"]
+
+        widths = {
+            "A": 28,
+            "B": 60,
+            "C": 60,
+            "D": 14,
+            "E": 22,
+        }
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
+
+    output.seek(0)
+    return output
+
+
+def _build_parse_filename(filters_state: dict) -> str:
+    ts = datetime.now(MOSCOW_TZ).strftime("%Y%m%d_%H%M")
+    price_from = filters_state.get("price_from")
+    price_to = filters_state.get("price_to")
+    price_label = f"{price_from if price_from is not None else 0}-{price_to if price_to is not None else 'max'}"
+    return f"finn_parse_{ts}_{price_label}.xlsx"
+
+
+def _extract_parse_rows(df: pd.DataFrame) -> List[dict]:
+    rows: List[dict] = []
+    for _, row in df.fillna("").iterrows():
+        url = row.get("ссылка") or row.get("url") or row.get("link") or ""
+        url = str(url).strip()
+        if not url:
+            continue
+        rows.append(
+            {
+                "категория": str(row.get("категория") or row.get("category") or "").strip(),
+                "название": str(row.get("название") or row.get("title") or "").strip(),
+                "ссылка": url,
+                "цена": str(row.get("цена") or row.get("price") or "").strip(),
+                "дата парса": str(row.get("дата парса") or row.get("parse_date") or "").strip(),
+            }
+        )
+    return rows
+
+
+def _merge_parse_rows(existing: List[dict], incoming: List[dict]) -> List[dict]:
+    merged: Dict[str, dict] = {}
+    for row in existing + incoming:
+        url = str(row.get("ссылка", "")).strip()
+        if not url:
+            continue
+        merged[url] = row
+    return list(merged.values())
+
+
+def _sheet_name(xls: pd.ExcelFile) -> str:
+    return "data" if "data" in xls.sheet_names else xls.sheet_names[0]
+
+
+def _extract_xlsx_rows(file_bytes: bytearray) -> tuple[List[dict], List[dict]]:
+    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    df = pd.read_excel(xls, sheet_name=_sheet_name(xls))
+    return _extract_input_rows(df), _extract_parse_rows(df)
+
+
+def _is_recheck_status(status: str) -> bool:
+    return status in {"Solgt", "Inaktiv"}
+
+
+def _is_404_status(status: str) -> bool:
+    return status == "404"
+
+
+def _status_label(status: str) -> str:
+    if _is_404_status(status):
+        return "404"
+    if _is_recheck_status(status):
+        return status
+    return "Aktiv"
+
+
+def _recheck_no_rows_text() -> str:
+    return "Проданных/инактивных объявлений не найдено."
+
+
+def _recheck_status_value(status: str) -> str:
+    return _status_label(status)
+
+
+def _recheck_should_include(status: str) -> bool:
+    return _is_recheck_status(status)
+
+
+def _recheck_should_alert(status: str) -> bool:
+    return _is_recheck_status(status)
+
+
+def _linkcheck_text(details: dict, url: str) -> str:
+    return (
+        f"Название: {details.get('title', '')}\n"
+        f"Статус: {_recheck_status_value(str(details.get('status', '')))}\n"
+        f"Цена: {details.get('price', '')}\n"
+        f"Дата: {details.get('date', '')}\n"
+        f"Ссылка: {url}"
+    )
+
+
+async def _send_linkcheck_result(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    details: dict,
+    url: str,
+) -> None:
+    caption = _linkcheck_text(details, url)[:1024]
+    photos = details.get("photos") or []
+    photos = [p for p in photos if isinstance(p, str) and p.strip()]
+
+    if photos:
+        media = [InputMediaPhoto(media=photos[0], caption=caption)]
+        for photo in photos[1:10]:
+            media.append(InputMediaPhoto(media=photo))
+        try:
+            await context.bot.send_media_group(chat_id=message.chat_id, media=media)
+            return
+        except Exception:
+            pass
+
+    photo = str(details.get("photo") or "").strip()
+    if photo:
+        try:
+            await message.reply_photo(photo=photo, caption=caption)
+            return
+        except Exception:
+            pass
+
+    await message.reply_text(caption)
+
+
+def _recheck_alert_text(row: dict) -> str:
+    return (
+        f"Статус: {row.get('статус', '')}\n"
+        f"Название: {row.get('название', '')}\n"
+        f"Цена: {row.get('цена', '')}\n"
+        f"Ссылка: {row.get('ссылка', '')}"
+    )
+
+
+def _merge_ready_text(count: int) -> str:
+    return f"Объединение готово. Уникальных объявлений: {count}"
+
+
+def _merge_prompt_text() -> str:
+    return "Пришли XLSX файл(ы) парса. Я объединю их в один без дублей по ссылке."
+
+
+def _merge_filename() -> str:
+    ts = datetime.now(MOSCOW_TZ).strftime("%Y%m%d_%H%M")
+    return f"finn_merged_{ts}.xlsx"
+
+
+def _merge_state_rows(context: ContextTypes.DEFAULT_TYPE) -> List[dict]:
+    rows = context.user_data.get("merge_parse_rows", [])
+    return rows if isinstance(rows, list) else []
+
+
+def _save_merge_state_rows(context: ContextTypes.DEFAULT_TYPE, rows: List[dict]) -> None:
+    context.user_data["merge_parse_rows"] = rows
+
+
+def _set_mode_merge(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["await_merge_parse"] = True
+    context.user_data["await_recheck"] = False
+    context.user_data["await_link_check"] = False
+
+
+def _set_mode_recheck(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["await_recheck"] = True
+    context.user_data["await_merge_parse"] = False
+    context.user_data["await_link_check"] = False
+
+
+def _set_mode_linkcheck(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["await_link_check"] = True
+    context.user_data["await_recheck"] = False
+    context.user_data["await_merge_parse"] = False
+
+
+def _clear_merge_mode(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["await_merge_parse"] = False
+    context.user_data["merge_parse_rows"] = []
 
 
 def _filters_summary(filters_state: dict) -> str:
@@ -345,6 +569,7 @@ async def parse_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     _init_user_state(context)
     context.user_data["await_recheck"] = False
+    context.user_data["await_merge_parse"] = False
     if update.message:
         await update.message.reply_text(
             "Выбери категории для парса (можно несколько):",
@@ -356,7 +581,7 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not await _ensure_authorized(update, context):
         return
     _init_user_state(context)
-    context.user_data["await_recheck"] = True
+    _set_mode_recheck(context)
     if update.message:
         await update.message.reply_text("Пришли XLSX файл для ре-чека.")
 
@@ -365,9 +590,9 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await _ensure_authorized(update, context):
         return
     _init_user_state(context)
-    context.user_data["await_link_check"] = True
+    _set_mode_linkcheck(context)
     if update.message:
-        await update.message.reply_text("Пришли одну ссылку на объявление FINN. Верну статус и лайки.")
+        await update.message.reply_text("Пришли одну ссылку на объявление FINN. Верну статус, цену и дату.")
 
 
 async def handle_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -387,14 +612,20 @@ async def handle_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if action == "recheck":
         _init_user_state(context)
-        context.user_data["await_recheck"] = True
+        _set_mode_recheck(context)
         await _safe_edit_or_send(update, "Пришли XLSX файл для ре-чека.")
+        return
+
+    if action == "merge":
+        _init_user_state(context)
+        _set_mode_merge(context)
+        await _safe_edit_or_send(update, _merge_prompt_text())
         return
 
     if action == "linkcheck":
         _init_user_state(context)
-        context.user_data["await_link_check"] = True
-        await _safe_edit_or_send(update, "Пришли одну ссылку на объявление FINN. Верну статус и лайки.")
+        _set_mode_linkcheck(context)
+        await _safe_edit_or_send(update, "Пришли одну ссылку на объявление FINN. Верну статус, цену и дату.")
 
 
 async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -564,7 +795,7 @@ async def _run_parse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     output = _build_parse_xlsx(deduped)
 
     await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-    await message.reply_document(document=output, filename="finn_parse.xlsx")
+    await message.reply_document(document=output, filename=_build_parse_filename(filters_state))
     try:
         await progress_message.edit_text(
             f"Прогресс парса: {_progress_bar(total_categories, total_categories)}\n"
@@ -677,13 +908,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         await message.reply_text("Проверяю ссылку...")
         details = await fetch_listing_detail(url)
-        await message.reply_text(
-            f"Статус: {details.get('status', '')}\n"
-            f"Лайки: {details.get('likes', 0)}\n"
-            f"Ссылка: {url}"
-        )
+        await _send_linkcheck_result(message, context, details, url)
         context.user_data["await_link_check"] = False
-        await message.reply_text("Выбери действие:", reply_markup=_main_keyboard())
         return
 
     if "finn.no/recommerce/forsale/item/" in text:
@@ -691,11 +917,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if url:
             await message.reply_text("Проверяю ссылку...")
             details = await fetch_listing_detail(url)
-            await message.reply_text(
-                f"Статус: {details.get('status', '')}\n"
-                f"Лайки: {details.get('likes', 0)}\n"
-                f"Ссылка: {url}"
-            )
+            await _send_linkcheck_result(message, context, details, url)
             return
 
 
@@ -704,13 +926,7 @@ async def _send_recheck_alert(
     context: ContextTypes.DEFAULT_TYPE,
     row: dict,
 ) -> None:
-    caption = (
-        f"Статус: {row.get('статус', '')}\n"
-        f"Название: {row.get('название', '')}\n"
-        f"Лайки: {row.get('количество лайков', 0)}\n"
-        f"Цена: {row.get('цена', '')}\n"
-        f"Ссылка: {row.get('ссылка', '')}"
-    )
+    caption = _recheck_alert_text(row)
     caption = caption[:1000]
 
     photo = row.get("фото", "")
@@ -735,9 +951,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     mode = None
     if context.user_data.get("await_recheck"):
         mode = "recheck"
+    if context.user_data.get("await_merge_parse"):
+        mode = "merge"
 
     if mode is None:
-        await message.reply_text("Сейчас не ожидаю файл. Нажми «Ре-чек».")
+        await message.reply_text("Сейчас не ожидаю файл. Нажми «Ре-чек» или «Объединить парсы».")
         return
 
     doc = message.document
@@ -745,21 +963,31 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("Нужен XLSX файл.")
         return
 
-    context.user_data["await_recheck"] = False
-
     await message.chat.send_action(ChatAction.TYPING)
     telegram_file = await doc.get_file()
     file_bytes = await telegram_file.download_as_bytearray()
 
     try:
-        xls = pd.ExcelFile(io.BytesIO(file_bytes))
+        input_rows, parse_rows = _extract_xlsx_rows(file_bytes)
     except Exception:
         await message.reply_text("Файл не читается как XLSX.")
         return
 
-    sheet_name = "data" if "data" in xls.sheet_names else xls.sheet_names[0]
-    df = pd.read_excel(xls, sheet_name=sheet_name)
-    input_rows = _extract_input_rows(df)
+    if mode == "merge":
+        incoming = parse_rows
+        if not incoming:
+            await message.reply_text("В файле нет строк парса (с колонкой ссылки).")
+            return
+        merged = _merge_parse_rows(_merge_state_rows(context), incoming)
+        _save_merge_state_rows(context, merged)
+        output = _build_merge_xlsx(merged)
+        await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        await message.reply_document(document=output, filename=_merge_filename())
+        await message.reply_text(_merge_ready_text(len(merged)))
+        await message.reply_text(_merge_prompt_text(), reply_markup=_main_keyboard())
+        return
+
+    context.user_data["await_recheck"] = False
 
     if not input_rows:
         await message.reply_text("В файле нет ссылок для проверки.")
@@ -793,46 +1021,69 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     results = await recheck_rows(
         input_rows,
         concurrency=5,
-        include_active=False,
+        include_active=True,
         progress_cb=_on_progress,
     )
-    if not results:
+    filtered_results = [item for item in results if _recheck_should_include(item.status)]
+    active_results = [item for item in results if item.status == "Aktiv"]
+    if not filtered_results and not active_results:
         try:
             await progress_message.edit_text(
                 f"{started_text}: {_progress_bar(total, total)}\nПроверено: {total}/{total}\nГотово."
             )
         except Exception:
             pass
-        await message.reply_text("Проданных/инактивных/404 объявлений не найдено.")
+        await message.reply_text("Подходящих объявлений для выдачи не найдено.")
         await message.reply_text("Выбери действие:", reply_markup=_main_keyboard())
         return
 
     recheck_table_rows: List[dict] = []
-    for item in results:
+    for item in filtered_results:
         row = {
             "категория": item.category,
             "название": item.title,
             "ссылка": item.url,
-            "количество лайков": item.likes,
             "цена": item.price,
             "дата": item.date,
             "статус": item.status,
             "фото": item.photo,
         }
         recheck_table_rows.append(row)
-        await _send_recheck_alert(message.chat_id, context, row)
+        if _recheck_should_alert(item.status):
+            await _send_recheck_alert(message.chat_id, context, row)
 
-    output = _build_recheck_xlsx(recheck_table_rows)
+    active_table_rows: List[dict] = []
+    for item in active_results:
+        active_table_rows.append(
+            {
+                "категория": item.category,
+                "название": item.title,
+                "ссылка": item.url,
+                "цена": item.price,
+                "дата": item.date,
+                "статус": item.status,
+                "фото": item.photo,
+            }
+        )
 
-    await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-    await message.reply_document(document=output, filename="finn_recheck.xlsx")
+    if recheck_table_rows:
+        output = _build_recheck_xlsx(recheck_table_rows)
+        await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        await message.reply_document(document=output, filename="finn_recheck.xlsx")
+
+    if active_table_rows:
+        active_output = _build_active_xlsx(active_table_rows)
+        await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        await message.reply_document(document=active_output, filename="finn_recheck_active.xlsx")
     try:
         await progress_message.edit_text(
             f"{started_text}: {_progress_bar(total, total)}\nПроверено: {total}/{total}\nГотово."
         )
     except Exception:
         pass
-    await message.reply_text(f"Ре-чек завершен. Найдено: {len(recheck_table_rows)}")
+    await message.reply_text(
+        f"Ре-чек завершен. Solgt/Inaktiv: {len(recheck_table_rows)} | Aktiv: {len(active_table_rows)}"
+    )
     await message.reply_text("Выбери действие:", reply_markup=_main_keyboard())
 
 
