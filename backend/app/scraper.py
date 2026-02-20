@@ -621,6 +621,48 @@ def _extract_photo_url(soup: BeautifulSoup, base_url: str) -> str:
     return ""
 
 
+def _extract_photo_urls(soup: BeautifulSoup, base_url: str, raw_html: str = "") -> List[str]:
+    urls: List[str] = []
+
+    def _add(candidate: str) -> None:
+        value = _normalize_url(base_url, _clean(candidate))
+        if not value:
+            return
+        if "images.finncdn.no" not in value:
+            return
+        if value in urls:
+            return
+        urls.append(value)
+
+    # Gallery images (src/data-src/srcset)
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src") or ""
+        if src:
+            _add(src)
+        srcset = _clean(img.get("srcset"))
+        if srcset:
+            parts = [part.strip().split(" ")[0] for part in srcset.split(",") if part.strip()]
+            for part in parts:
+                _add(part)
+
+    # Background-image URLs inside style attributes
+    for tag in soup.find_all(style=True):
+        style = str(tag.get("style") or "")
+        for match in re.findall(r"url\(([^)]+)\)", style):
+            _add(match.strip("'\""))
+
+    # Raw html fallback for dynamic content
+    for match in re.findall(r"https?://images\.finncdn\.no/[^\s\"'<>]+", raw_html or "", flags=re.IGNORECASE):
+        _add(match)
+
+    if not urls:
+        main = _extract_photo_url(soup, base_url)
+        if main:
+            urls.append(main)
+
+    return urls
+
+
 def _extract_title_detail(soup: BeautifulSoup) -> str:
     title = soup.find(attrs={"data-testid": "object-title"})
     if title:
@@ -647,6 +689,7 @@ async def fetch_listing_detail(url: str) -> dict:
             "date": _extract_last_updated(soup, html),
             "status": _extract_status(soup, status_code, html),
             "photo": _extract_photo_url(soup, url),
+            "photos": _extract_photo_urls(soup, url, html),
         }
 
     try:
@@ -664,6 +707,7 @@ async def fetch_listing_detail(url: str) -> dict:
                 "date": "",
                 "status": "404",
                 "photo": "",
+                "photos": [],
             }
 
     details = _parse_detail(html, status_code)
@@ -675,7 +719,7 @@ async def fetch_listing_detail(url: str) -> dict:
         and not details.get("date")
         and not details.get("title")
     )
-    if weak_details:
+    if weak_details or len(details.get("photos") or []) <= 1:
         try:
             rendered_html = await _fetch_playwright_html(url)
             details = _parse_detail(rendered_html, status_code)
