@@ -11,6 +11,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from playwright.async_api import Browser, Playwright
 
 BASE_URL = "https://www.finn.no/recommerce/forsale/search"
 KNOWN_CATEGORIES = [("Torget", BASE_URL)]
@@ -78,6 +79,11 @@ PRICE_RE = re.compile(r"\d[\d\s\u00a0]*\s*kr", re.IGNORECASE)
 LIKES_RE = re.compile(r"^\d+$")
 LAST_UPDATED_RE = re.compile(r"Sist\s+endret\s*:\s*([^・·]+)", re.IGNORECASE)
 ProgressCallback = Optional[Callable[[dict], Any]]
+_HTTPX_CLIENT: Optional[httpx.AsyncClient] = None
+_HTTPX_CLIENT_LOCK = asyncio.Lock()
+_PLAYWRIGHT: Optional[Playwright] = None
+_PLAYWRIGHT_BROWSER: Optional[Browser] = None
+_PLAYWRIGHT_LOCK = asyncio.Lock()
 
 
 def _clean(value: Any) -> str:
@@ -116,30 +122,65 @@ async def _emit_progress(progress_cb: ProgressCallback, payload: dict) -> None:
 
 
 async def _fetch_httpx_response(url: str, timeout_ms: int = 30000) -> tuple[str, int]:
-    timeout = httpx.Timeout(timeout_ms / 1000)
-    async with httpx.AsyncClient(
-        timeout=timeout,
-        headers={"User-Agent": USER_AGENT},
-        follow_redirects=True,
-    ) as client:
-        response = await client.get(url)
-        return response.text, response.status_code
+    client = await _get_httpx_client()
+    response = await client.get(url, timeout=timeout_ms / 1000)
+    return response.text, response.status_code
+
+
+async def _get_httpx_client() -> httpx.AsyncClient:
+    global _HTTPX_CLIENT
+
+    client = _HTTPX_CLIENT
+    if client is not None and not client.is_closed:
+        return client
+
+    async with _HTTPX_CLIENT_LOCK:
+        client = _HTTPX_CLIENT
+        if client is not None and not client.is_closed:
+            return client
+
+        _HTTPX_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0),
+            headers={"User-Agent": USER_AGENT},
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+        return _HTTPX_CLIENT
 
 
 async def _fetch_playwright_html(url: str, timeout_ms: int = 30000) -> str:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
+    browser = await _get_playwright_browser()
+    page = await browser.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        # Let client-side content hydrate without relaunching the browser per request.
+        await page.wait_for_timeout(1200)
+        return await page.content()
+    finally:
+        await page.close()
+
+
+async def _get_playwright_browser() -> Browser:
+    global _PLAYWRIGHT, _PLAYWRIGHT_BROWSER
+
+    browser = _PLAYWRIGHT_BROWSER
+    if browser is not None and browser.is_connected():
+        return browser
+
+    async with _PLAYWRIGHT_LOCK:
+        browser = _PLAYWRIGHT_BROWSER
+        if browser is not None and browser.is_connected():
+            return browser
+
+        if _PLAYWRIGHT is None:
+            _PLAYWRIGHT = await async_playwright().start()
+
+        _PLAYWRIGHT_BROWSER = await _PLAYWRIGHT.chromium.launch(
             headless=True,
             args=["--headless=new"],
             ignore_default_args=["--headless=old"],
         )
-        page = await browser.new_page()
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        # Let the search grid hydrate.
-        await page.wait_for_timeout(1200)
-        html = await page.content()
-        await browser.close()
-        return html
+        return _PLAYWRIGHT_BROWSER
 
 
 async def fetch_html(url: str, wait_for: Optional[str] = None, timeout_ms: int = 30000) -> str:
